@@ -1,6 +1,6 @@
 package Exception::Cxx;
 require DynaLoader;
-$VERSION = '1.00';
+$VERSION = '1.001';
 @ISA = 'DynaLoader';
 __PACKAGE__->bootstrap($VERSION);
 
@@ -17,22 +17,18 @@ __END__
 
 =head1 DESCRIPTION
 
-This module install arranges for perl to use ANSI C++ exceptions
-(instead of C<setjmp>/C<longjmp>).  The reason you might want this is
-for integration with 3rd party libraries that already make use of C++
-exceptions.
+This module arranges for perl to use ANSI C++ exceptions (instead of
+C<setjmp>/C<longjmp>).  The reason you might want this is for
+integration with 3rd party libraries that use C++ exceptions and
+cannot switch back to C<longjmp>.
 
 =head1 BUGS
 
-At the moment, this extension requires patches to the perl source
-code.  These changes will shortly be integrated into the perl
-development branch.  'cxxpatch' has been tested with 5.005_56.
+C<sigsetjmp> saves more state than catch {}.  In C++, C<sigprocmask> &
+C<priocntl> are not saved or restored.
 
-C<sigsetjmp> manages more state than C++.  C<sigprocmask> &
-C<priocntl> are not saved/restored.
-
-C++ exceptions will not work with the perl compiler backend.
-Actually, I think this is the perl compiler's bug.
+C++ exceptions will not work with the CC perl compiler backend.
+IMO, this is a bug in the backend.
 
 =head1 CONTACT
 

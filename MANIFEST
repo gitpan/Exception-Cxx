@@ -4,7 +4,6 @@ MANIFEST
 MANIFEST.SKIP
 Makefile.PL
 README
-cxxpatch
 hints/dec_osf.pl
 hints/solaris_2.pl
 t/runlevel.t

@@ -1,6 +1,6 @@
 #!./perl -w
 
-use 5.005;
+use 5.005_57;
 use strict;
 use ExtUtils::MakeMaker;
 
