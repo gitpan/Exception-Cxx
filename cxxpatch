@@ -1,0 +1,1017 @@
+
+From chip@perlsupport.com Tue Mar  9 10:29:11 1999
+Date: Tue, 9 Mar 1999 08:08:30 -0500
+From: chip@perlsupport.com
+To: joshua.pritikin@db.com
+Subject: Call the chorus back in!
+
+I think I've got it this time...  Below is the full (!) C++ exceptions
+patch, including the notes I plan to send to p5p.
+
+Joe Bob says: "Check it out!"
+
+------------------------------------------------------------------------
+The below patch makes it possible for the Perl core to throw and catch
+exceptions using methods other than setjmp/longjmp, if such are
+available.
+
+Specifically, it permits the use of C++ try/catch/throw, which is very
+useful -- practically required, actually -- when linking Perl with
+some third-party libraries.  (ObjectStore is the poster child.)
+
+I've tested this patch with and without both multiplity and threading.
+However, I don't know how to build for PERL_OBJECT, so I'd appreciate
+someone who does (Sarathy? :-)) explaining how and/or trying it.
+
+There are some potential issues WRT binary compatibility.  Since I
+don't know the degree of bincompat that's required or desired between
+5.005 and 5.006, I ask for input on them:
+
+  1. The PERL_OBJECT gains a new member variable.  I would
+     have put it into the bincompat area reserved for such
+     new variables, but this one is thread-specific, so when
+     building for threads it doesn't go in the PERL_OBJECT
+     at all.
+
+     I really don't know how to handle this.  If bincompat
+     between 5.005 and 5.006 is vital, then we could just
+     put the field into the PERL_OBJECT and dispense with
+     making it thread-specific (a cool but not vital hack).
+
+  2. The PERL_OBJECT gains a new virtual member, which I duly
+     put at the end of the list in proto.h.  So this probably
+     isn't a problem.
+
+  3. The JMPENV structure gains a new member at the end.
+     We can do without it through the use of some handwaving
+     and a union in the JMPENV, but I'd really rather not;
+     and since the JMPENV and its macros aren't documented
+     in pod/*.pod, I think we can just accept this change.
+
+
+Index: perl.h
+***************
+*** 108,114 ****
+  #define _PERL_OBJECT_THIS ,this
+  #define PERL_OBJECT_THIS_ this,
+! #define CALLRUNOPS (this->*PL_runops)
+! #define CALLREGCOMP (this->*PL_regcompp)
+! #define CALLREGEXEC (this->*PL_regexecp)
+  
+  #else /* !PERL_OBJECT */
+--- 108,112 ----
+  #define _PERL_OBJECT_THIS ,this
+  #define PERL_OBJECT_THIS_ this,
+! #define CALL_FPTR(fptr) (this->*fptr)
+  
+  #else /* !PERL_OBJECT */
+***************
+*** 124,132 ****
+  #define _PERL_OBJECT_THIS
+  #define PERL_OBJECT_THIS_
+! #define CALLRUNOPS (*PL_runops)
+! #define CALLREGCOMP (*PL_regcompp)
+! #define CALLREGEXEC (*PL_regexecp)
+  
+  #endif /* PERL_OBJECT */
+  
+  #define VOIDUSED 1
+--- 122,133 ----
+  #define _PERL_OBJECT_THIS
+  #define PERL_OBJECT_THIS_
+! #define CALL_FPTR(fptr) (*fptr)
+  
+  #endif /* PERL_OBJECT */
++ 
++ #define CALLRUNOPS  CALL_FPTR(PL_runops)
++ #define CALLREGCOMP CALL_FPTR(PL_regcompp)
++ #define CALLREGEXEC CALL_FPTR(PL_regexecp)
++ #define CALLPROTECT CALL_FPTR(PL_protect)
+  
+  #define VOIDUSED 1
+
+Index: proto.h
+***************
+*** 743,746 ****
+--- 743,752 ----
+  U32 seed _((void));
+  OP *docatch _((OP *o));
++ void *docatch_body _((va_list args));
++ void *perl_parse_body _((va_list args));
++ void *perl_run_body _((va_list args));
++ void *perl_call_body _((va_list args));
++ void perl_call_xbody _((OP *myop, int is_eval));
++ void *call_list_body _((va_list args));
+  OP *dofindlabel _((OP *o, char *label, OP **opstack, OP **oplimit));
+  void doparseform _((SV *sv));
+***************
+*** 968,969 ****
+--- 974,976 ----
+  VIRTUAL char* sv_2pv_nolen _((SV* sv));
+  VIRTUAL char* sv_pv _((SV *sv));
++ VIRTUAL void* default_protect _((int *except, protect_body_t, ...));
+
+Index: scope.h
+***************
+*** 148,158 ****
+  struct jmpenv {
+      struct jmpenv *	je_prev;
+!     Sigjmp_buf		je_buf;		
+!     int			je_ret;		/* return value of last setjmp() */
+!     bool		je_mustcatch;	/* longjmp()s must be caught locally */
+  };
+  
+  typedef struct jmpenv JMPENV;
+  
+  #ifdef OP_IN_REGISTER
+  #define OP_REG_TO_MEM	PL_opsave = op
+--- 148,186 ----
+  struct jmpenv {
+      struct jmpenv *	je_prev;
+!     Sigjmp_buf		je_buf;		/* only for use if !je_throw */
+!     int			je_ret;		/* last exception thrown */
+!     bool		je_mustcatch;	/* need to call longjmp()? */
+!     void		(*je_throw)(int v); /* last for bincompat */
+  };
+  
+  typedef struct jmpenv JMPENV;
+  
++ /*
++  * Function that catches/throws, and its callback for the
++  *  body of protected processing.
++  */
++ typedef void *(CPERLscope(*protect_body_t)) _((va_list args));
++ typedef void *(CPERLscope(*protect_proc_t))
++ 			_((int *except, protect_body_t, ...));
++ 
++ /*
++  * How to build the first jmpenv.
++  *
++  * top_env needs to be non-zero. It points to an area
++  * in which longjmp() stuff is stored, as C callstack
++  * info there at least is thread specific this has to
++  * be per-thread. Otherwise a 'die' in a thread gives
++  * that thread the C stack of last thread to do an eval {}!
++  */
++ 
++ #define JMPENV_BOOTSTRAP \
++     STMT_START {				\
++ 	PL_start_env.je_prev = NULL;		\
++ 	PL_start_env.je_throw = NULL;		\
++ 	PL_start_env.je_ret = -1;		\
++ 	PL_start_env.je_mustcatch = TRUE;	\
++ 	PL_top_env = &PL_start_env;		\
++     } STMT_END
++ 
+  #ifdef OP_IN_REGISTER
+  #define OP_REG_TO_MEM	PL_opsave = op
+***************
+*** 163,190 ****
+  #endif
+  
+  #define dJMPENV		JMPENV cur_env
+! #define JMPENV_PUSH(v) \
+      STMT_START {					\
+  	cur_env.je_prev = PL_top_env;			\
+  	OP_REG_TO_MEM;					\
+! 	cur_env.je_ret = PerlProc_setjmp(cur_env.je_buf, 1);	\
+  	OP_MEM_TO_REG;					\
+  	PL_top_env = &cur_env;				\
+- 	cur_env.je_mustcatch = FALSE;			\
+- 	(v) = cur_env.je_ret;				\
+      } STMT_END
+  #define JMPENV_POP \
+      STMT_START { PL_top_env = cur_env.je_prev; } STMT_END
+  #define JMPENV_JUMP(v) \
+      STMT_START {						\
+  	OP_REG_TO_MEM;						\
+! 	if (PL_top_env->je_prev)					\
+! 	    PerlProc_longjmp(PL_top_env->je_buf, (v));			\
+  	if ((v) == 2)						\
+! 	    PerlProc_exit(STATUS_NATIVE_EXPORT);				\
+  	PerlIO_printf(PerlIO_stderr(), "panic: top_env\n");	\
+! 	PerlProc_exit(1);						\
+      } STMT_END
+!    
+  #define CATCH_GET	(PL_top_env->je_mustcatch)
+  #define CATCH_SET(v)	(PL_top_env->je_mustcatch = (v))
+--- 191,270 ----
+  #endif
+  
++ /*
++  * These exception-handling macros are split up to
++  * ease integration with C++ exceptions.
++  *
++  * To use C++ try+catch to catch Perl exceptions, an extension author
++  * needs to first write an extern "C" function to throw an appropriate
++  * exception object; typically it will be or contain an integer,
++  * because Perl's internals use integers to track exception types:
++  *    extern "C" { static void thrower(int i) { throw i; } }
++  *
++  * Then (as shown below) the author needs to use, not the simple
++  * JMPENV_PUSH, but several of its constitutent macros, to arrange for
++  * the Perl internals to call thrower() rather than longjmp() to
++  * report exceptions:
++  *
++  *    dJMPENV;
++  *    JMPENV_PUSH_INIT(thrower);
++  *    try {
++  *        ... stuff that may throw exceptions ...
++  *    }
++  *    catch (int why) {  // or whatever matches thrower()
++  *        JMPENV_POST_CATCH;
++  *        EXCEPT_SET(why);
++  *        switch (why) {
++  *          ... // handle various Perl exception codes
++  *        }
++  *    }
++  *    JMPENV_POP;  // don't forget this!
++  */
++ 
+  #define dJMPENV		JMPENV cur_env
+! 
+! #define JMPENV_PUSH_INIT(THROWFUNC) \
+      STMT_START {					\
++ 	cur_env.je_throw = (THROWFUNC);			\
++ 	cur_env.je_ret = -1;				\
++ 	cur_env.je_mustcatch = FALSE;			\
+  	cur_env.je_prev = PL_top_env;			\
++ 	PL_top_env = &cur_env;				\
+  	OP_REG_TO_MEM;					\
+!     } STMT_END
+! #define JMPENV_POST_CATCH \
+!     STMT_START {					\
+  	OP_MEM_TO_REG;					\
+  	PL_top_env = &cur_env;				\
+      } STMT_END
++ 
++ #define JMPENV_PUSH(v) \
++     STMT_START {					\
++ 	JMPENV_PUSH_INIT(NULL);				\
++ 	EXCEPT_SET(PerlProc_setjmp(cur_env.je_buf, 1));	\
++ 	JMPENV_POST_CATCH;				\
++ 	(v) = EXCEPT_GET;				\
++     } STMT_END
++ 
+  #define JMPENV_POP \
+      STMT_START { PL_top_env = cur_env.je_prev; } STMT_END
++ 
+  #define JMPENV_JUMP(v) \
+      STMT_START {						\
+  	OP_REG_TO_MEM;						\
+! 	if (PL_top_env->je_prev) {				\
+! 	    if (PL_top_env->je_throw)				\
+! 		PL_top_env->je_throw(v);			\
+! 	    else						\
+! 		PerlProc_longjmp(PL_top_env->je_buf, (v));	\
+! 	}							\
+  	if ((v) == 2)						\
+! 	    PerlProc_exit(STATUS_NATIVE_EXPORT);		\
+  	PerlIO_printf(PerlIO_stderr(), "panic: top_env\n");	\
+! 	PerlProc_exit(1);					\
+      } STMT_END
+! 
+! #define EXCEPT_GET	(cur_env.je_ret)
+! #define EXCEPT_SET(v)	(cur_env.je_ret = (v))
+! 
+  #define CATCH_GET	(PL_top_env->je_mustcatch)
+  #define CATCH_SET(v)	(PL_top_env->je_mustcatch = (v))
+
+Index: thrdvar.h
+***************
+*** 94,99 ****
+--- 94,101 ----
+  PERLVAR(Tcurstackinfo,	PERL_SI *)	/* current stack + context */
+  PERLVAR(Tmainstack,	AV *)		/* the stack when nothing funny is happening */
++ 
+  PERLVAR(Ttop_env,	JMPENV *)	/* ptr. to current sigjmp() environment */
+  PERLVAR(Tstart_env,	JMPENV)		/* empty startup sigjmp() environment */
++ PERLVARI(Tprotect,	protect_proc_t,	FUNC_NAME_TO_PTR(default_protect))
+  
+  /* statics "owned" by various functions */
+
+Index: global.sym
+***************
+*** 91,94 ****
+--- 91,95 ----
+  debstack
+  debstackptrs
++ default_protect
+  delimcpy
+  deprecate
+
+Index: perl.c
+*************** static void init_debugger _((void));
+*** 54,57 ****
+--- 54,62 ----
+  static void init_lexer _((void));
+  static void init_main_stash _((void));
++ static void *perl_parse_body _((va_list args));
++ static void *perl_run_body _((va_list args));
++ static void *perl_call_body _((va_list args));
++ static void perl_call_xbody _((OP *myop, int is_eval));
++ static void *call_list_body _((va_list args));
+  #ifdef USE_THREADS
+  static struct perl_thread * init_main_thread _((void));
+*************** perl_construct(register PerlInterpreter 
+*** 146,149 ****
+--- 151,156 ----
+  #endif /* USE_THREADS */
+  
++ 	PL_protect = FUNC_NAME_TO_PTR(default_protect); /* for exceptions */
++ 
+  	PL_curcop = &PL_compiling;	/* needed by ckWARN, right away */
+  
+*************** perl_construct(register PerlInterpreter 
+*** 203,210 ****
+      PL_lex_state = LEX_NOTPARSING;
+  
+!     PL_start_env.je_prev = NULL;
+!     PL_start_env.je_ret = -1;
+!     PL_start_env.je_mustcatch = TRUE;
+!     PL_top_env     = &PL_start_env;
+      STATUS_ALL_SUCCESS;
+  
+--- 210,214 ----
+      PL_lex_state = LEX_NOTPARSING;
+  
+!     JMPENV_BOOTSTRAP;
+      STATUS_ALL_SUCCESS;
+  
+*************** perl_parse(PerlInterpreter *sv_interp, v
+*** 635,648 ****
+  {
+      dTHR;
+-     register SV *sv;
+-     register char *s;
+-     char *scriptname = NULL;
+-     VOL bool dosearch = FALSE;
+-     char *validarg = "";
+      I32 oldscope;
+-     AV* comppadlist;
+-     dJMPENV;
+      int ret;
+-     int fdscript = -1;
+  
+  #ifdef SETUID_SCRIPTS_ARE_SECURE_NOW
+--- 639,644 ----
+*************** setuid perl scripts securely.\n");
+*** 695,700 ****
+      PL_dowarn = G_WARN_OFF;
+  
+!     JMPENV_PUSH(ret);
+      switch (ret) {
+      case 1:
+  	STATUS_ALL_FAILURE;
+--- 691,702 ----
+      PL_dowarn = G_WARN_OFF;
+  
+!     CALLPROTECT(&ret, perl_parse_body, env
+! #ifndef PERL_OBJECT
+! 		, xsinit
+! #endif
+! 		);
+      switch (ret) {
++     case 0:
++ 	return 0;
+      case 1:
+  	STATUS_ALL_FAILURE;
+*************** setuid perl scripts securely.\n");
+*** 708,718 ****
+  	if (PL_endav)
+  	    call_list(oldscope, PL_endav);
+- 	JMPENV_POP;
+  	return STATUS_NATIVE_EXPORT;
+      case 3:
+- 	JMPENV_POP;
+  	PerlIO_printf(PerlIO_stderr(), "panic: top_env\n");
+  	return 1;
+      }
+  
+      sv_setpvn(PL_linestr,"",0);
+--- 710,739 ----
+  	if (PL_endav)
+  	    call_list(oldscope, PL_endav);
+  	return STATUS_NATIVE_EXPORT;
+      case 3:
+  	PerlIO_printf(PerlIO_stderr(), "panic: top_env\n");
+  	return 1;
+      }
++ }
++ 
++ STATIC void *
++ perl_parse_body(va_list args)
++ {
++     dTHR;
++     int argc = PL_origargc;
++     char **argv = PL_origargv;
++     char **env = va_arg(args, char**);
++     char *scriptname = NULL;
++     int fdscript = -1;
++     VOL bool dosearch = FALSE;
++     char *validarg = "";
++     AV* comppadlist;
++     register SV *sv;
++     register char *s;
++ 
++ #ifndef PERL_OBJECT
++     typedef void (*xs_init_t)(void);
++     xs_init_t xsinit = va_arg(args, xs_init_t);
++ #endif
+  
+      sv_setpvn(PL_linestr,"",0);
+*************** print \"  \\@INC:\\n    @INC\\n\";");
+*** 1022,1027 ****
+      ENTER;
+      PL_restartop = 0;
+!     JMPENV_POP;
+!     return 0;
+  }
+  
+--- 1043,1047 ----
+      ENTER;
+      PL_restartop = 0;
+!     return NULL;
+  }
+  
+*************** perl_run(PerlInterpreter *sv_interp)
+*** 1035,1039 ****
+      dTHR;
+      I32 oldscope;
+-     dJMPENV;
+      int ret;
+  
+--- 1055,1058 ----
+*************** perl_run(PerlInterpreter *sv_interp)
+*** 1045,1055 ****
+      oldscope = PL_scopestack_ix;
+  
+!     JMPENV_PUSH(ret);
+      switch (ret) {
+      case 1:
+  	cxstack_ix = -1;		/* start context stack again */
+! 	break;
+!     case 2:
+! 	/* my_exit() was called */
+  	while (PL_scopestack_ix > oldscope)
+  	    LEAVE;
+--- 1064,1075 ----
+      oldscope = PL_scopestack_ix;
+  
+!  redo_body:
+!     CALLPROTECT(&ret, perl_run_body, oldscope);
+      switch (ret) {
+      case 1:
+  	cxstack_ix = -1;		/* start context stack again */
+! 	goto redo_body;
+!     case 0:  /* normal completion */
+!     case 2:  /* my_exit() */
+  	while (PL_scopestack_ix > oldscope)
+  	    LEAVE;
+*************** perl_run(PerlInterpreter *sv_interp)
+*** 1062,1078 ****
+  	    dump_mstats("after execution:  ");
+  #endif
+- 	JMPENV_POP;
+  	return STATUS_NATIVE_EXPORT;
+      case 3:
+! 	if (!PL_restartop) {
+! 	    PerlIO_printf(PerlIO_stderr(), "panic: restartop\n");
+! 	    FREETMPS;
+! 	    JMPENV_POP;
+! 	    return 1;
+  	}
+! 	POPSTACK_TO(PL_mainstack);
+! 	break;
+      }
+  
+      DEBUG_r(PerlIO_printf(Perl_debug_log, "%s $` $& $' support.\n",
+                      PL_sawampersand ? "Enabling" : "Omitting"));
+--- 1082,1106 ----
+  	    dump_mstats("after execution:  ");
+  #endif
+  	return STATUS_NATIVE_EXPORT;
+      case 3:
+! 	if (PL_restartop) {
+! 	    POPSTACK_TO(PL_mainstack);
+! 	    goto redo_body;
+  	}
+! 	PerlIO_printf(PerlIO_stderr(), "panic: restartop\n");
+! 	FREETMPS;
+! 	return 1;
+      }
+  
++     /* NOTREACHED */
++     return 0;
++ }
++ 
++ STATIC void *
++ perl_run_body(va_list args)
++ {
++     dTHR;
++     I32 oldscope = va_arg(args, I32);
++ 
+      DEBUG_r(PerlIO_printf(Perl_debug_log, "%s $` $& $' support.\n",
+                      PL_sawampersand ? "Enabling" : "Omitting"));
+*************** perl_run(PerlInterpreter *sv_interp)
+*** 1089,1093 ****
+  	}
+  	if (PERLDB_SINGLE && PL_DBsingle)
+! 	   sv_setiv(PL_DBsingle, 1); 
+  	if (PL_initav)
+  	    call_list(oldscope, PL_initav);
+--- 1117,1121 ----
+  	}
+  	if (PERLDB_SINGLE && PL_DBsingle)
+! 	    sv_setiv(PL_DBsingle, 1); 
+  	if (PL_initav)
+  	    call_list(oldscope, PL_initav);
+*************** perl_run(PerlInterpreter *sv_interp)
+*** 1107,1113 ****
+      }
+  
+!     my_exit(0);
+!     /* NOTREACHED */
+!     return 0;
+  }
+  
+--- 1135,1139 ----
+      }
+  
+!     return NULL;
+  }
+  
+*************** perl_call_sv(SV *sv, I32 flags)
+*** 1226,1230 ****
+      I32 oldscope;
+      bool oldcatch = CATCH_GET;
+-     dJMPENV;
+      int ret;
+      OP* oldop = PL_op;
+--- 1252,1255 ----
+*************** perl_call_sv(SV *sv, I32 flags)
+*** 1259,1263 ****
+  	PL_op->op_private |= OPpENTERSUB_DB;
+  
+!     if (flags & G_EVAL) {
+  	cLOGOP->op_other = PL_op;
+  	PL_markstack_ptr--;
+--- 1284,1294 ----
+  	PL_op->op_private |= OPpENTERSUB_DB;
+  
+!     if (!(flags & G_EVAL)) {
+! 	CATCH_SET(TRUE);
+! 	perl_call_xbody((OP*)&myop, FALSE);
+! 	retval = PL_stack_sp - (PL_stack_base + oldmark);
+! 	CATCH_SET(FALSE);
+!     }
+!     else {
+  	cLOGOP->op_other = PL_op;
+  	PL_markstack_ptr--;
+*************** perl_call_sv(SV *sv, I32 flags)
+*** 1283,1289 ****
+  	PL_markstack_ptr++;
+  
+! 	JMPENV_PUSH(ret);
+  	switch (ret) {
+  	case 0:
+  	    break;
+  	case 1:
+--- 1314,1324 ----
+  	PL_markstack_ptr++;
+  
+!   redo_body:
+! 	CALLPROTECT(&ret, perl_call_body, (OP*)&myop, FALSE);
+  	switch (ret) {
+  	case 0:
++ 	    retval = PL_stack_sp - (PL_stack_base + oldmark);
++ 	    if (!(flags & G_KEEPERR))
++ 		sv_setpv(ERRSV,"");
+  	    break;
+  	case 1:
+*************** perl_call_sv(SV *sv, I32 flags)
+*** 1294,1298 ****
+  	    PL_curstash = PL_defstash;
+  	    FREETMPS;
+- 	    JMPENV_POP;
+  	    if (PL_statusvalue)
+  		croak("Callback called exit");
+--- 1329,1332 ----
+*************** perl_call_sv(SV *sv, I32 flags)
+*** 1303,1307 ****
+  		PL_op = PL_restartop;
+  		PL_restartop = 0;
+! 		break;
+  	    }
+  	    PL_stack_sp = PL_stack_base + oldmark;
+--- 1337,1341 ----
+  		PL_op = PL_restartop;
+  		PL_restartop = 0;
+! 		goto redo_body;
+  	    }
+  	    PL_stack_sp = PL_stack_base + oldmark;
+*************** perl_call_sv(SV *sv, I32 flags)
+*** 1312,1331 ****
+  		*++PL_stack_sp = &PL_sv_undef;
+  	    }
+! 	    goto cleanup;
+  	}
+-     }
+-     else
+- 	CATCH_SET(TRUE);
+  
+-     if (PL_op == (OP*)&myop)
+- 	PL_op = pp_entersub(ARGS);
+-     if (PL_op)
+- 	CALLRUNOPS();
+-     retval = PL_stack_sp - (PL_stack_base + oldmark);
+-     if ((flags & G_EVAL) && !(flags & G_KEEPERR))
+- 	sv_setpv(ERRSV,"");
+- 
+-   cleanup:
+-     if (flags & G_EVAL) {
+  	if (PL_scopestack_ix > oldscope) {
+  	    SV **newsp;
+--- 1346,1352 ----
+  		*++PL_stack_sp = &PL_sv_undef;
+  	    }
+! 	    break;
+  	}
+  
+  	if (PL_scopestack_ix > oldscope) {
+  	    SV **newsp;
+*************** perl_call_sv(SV *sv, I32 flags)
+*** 1341,1348 ****
+  	    LEAVE;
+  	}
+- 	JMPENV_POP;
+      }
+-     else
+- 	CATCH_SET(oldcatch);
+  
+      if (flags & G_DISCARD) {
+--- 1362,1366 ----
+*************** perl_call_sv(SV *sv, I32 flags)
+*** 1356,1359 ****
+--- 1374,1402 ----
+  }
+  
++ STATIC void *
++ perl_call_body(va_list args)
++ {
++     OP *myop = va_arg(args, OP*);
++     int is_eval = va_arg(args, int);
++ 
++     perl_call_xbody(myop, is_eval);
++     return NULL;
++ }
++ 
++ STATIC void
++ perl_call_xbody(OP *myop, int is_eval)
++ {
++     dTHR;
++ 
++     if (PL_op == myop) {
++ 	if (is_eval)
++ 	    PL_op = pp_entereval(ARGS);
++ 	else
++ 	    PL_op = pp_entersub(ARGS);
++     }
++     if (PL_op)
++ 	CALLRUNOPS();
++ }
++ 
+  /* Eval a string. The G_EVAL flag is always assumed. */
+  
+*************** perl_eval_sv(SV *sv, I32 flags)
+*** 1368,1372 ****
+      I32 retval;
+      I32 oldscope;
+-     dJMPENV;
+      int ret;
+      OP* oldop = PL_op;
+--- 1411,1414 ----
+*************** perl_eval_sv(SV *sv, I32 flags)
+*** 1394,1400 ****
+  	myop.op_flags |= OPf_SPECIAL;
+  
+!     JMPENV_PUSH(ret);
+      switch (ret) {
+      case 0:
+  	break;
+      case 1:
+--- 1436,1446 ----
+  	myop.op_flags |= OPf_SPECIAL;
+  
+!  redo_body:
+!     CALLPROTECT(&ret, perl_call_body, (OP*)&myop, TRUE);
+      switch (ret) {
+      case 0:
++ 	retval = PL_stack_sp - (PL_stack_base + oldmark);
++ 	if (!(flags & G_KEEPERR))
++ 	    sv_setpv(ERRSV,"");
+  	break;
+      case 1:
+*************** perl_eval_sv(SV *sv, I32 flags)
+*** 1405,1409 ****
+  	PL_curstash = PL_defstash;
+  	FREETMPS;
+- 	JMPENV_POP;
+  	if (PL_statusvalue)
+  	    croak("Callback called exit");
+--- 1451,1454 ----
+*************** perl_eval_sv(SV *sv, I32 flags)
+*** 1414,1418 ****
+  	    PL_op = PL_restartop;
+  	    PL_restartop = 0;
+! 	    break;
+  	}
+  	PL_stack_sp = PL_stack_base + oldmark;
+--- 1459,1463 ----
+  	    PL_op = PL_restartop;
+  	    PL_restartop = 0;
+! 	    goto redo_body;
+  	}
+  	PL_stack_sp = PL_stack_base + oldmark;
+*************** perl_eval_sv(SV *sv, I32 flags)
+*** 1423,1439 ****
+  	    *++PL_stack_sp = &PL_sv_undef;
+  	}
+! 	goto cleanup;
+      }
+  
+-     if (PL_op == (OP*)&myop)
+- 	PL_op = pp_entereval(ARGS);
+-     if (PL_op)
+- 	CALLRUNOPS();
+-     retval = PL_stack_sp - (PL_stack_base + oldmark);
+-     if (!(flags & G_KEEPERR))
+- 	sv_setpv(ERRSV,"");
+- 
+-   cleanup:
+-     JMPENV_POP;
+      if (flags & G_DISCARD) {
+  	PL_stack_sp = PL_stack_base + oldmark;
+--- 1468,1474 ----
+  	    *++PL_stack_sp = &PL_sv_undef;
+  	}
+! 	break;
+      }
+  
+      if (flags & G_DISCARD) {
+  	PL_stack_sp = PL_stack_base + oldmark;
+*************** call_list(I32 oldscope, AV *paramList)
+*** 2955,2987 ****
+  {
+      dTHR;
+      line_t oldline = PL_curcop->cop_line;
+      STRLEN len;
+-     dJMPENV;
+      int ret;
+  
+      while (AvFILL(paramList) >= 0) {
+! 	CV *cv = (CV*)av_shift(paramList);
+! 
+  	SAVEFREESV(cv);
+! 
+! 	JMPENV_PUSH(ret);
+  	switch (ret) {
+! 	case 0: {
+! 		SV* atsv = ERRSV;
+! 		PUSHMARK(PL_stack_sp);
+! 		perl_call_sv((SV*)cv, G_EVAL|G_DISCARD);
+! 		(void)SvPV(atsv, len);
+! 		if (len) {
+! 		    JMPENV_POP;
+! 		    PL_curcop = &PL_compiling;
+! 		    PL_curcop->cop_line = oldline;
+! 		    if (paramList == PL_beginav)
+! 			sv_catpv(atsv, "BEGIN failed--compilation aborted");
+! 		    else
+! 			sv_catpv(atsv, "END failed--cleanup aborted");
+! 		    while (PL_scopestack_ix > oldscope)
+! 			LEAVE;
+! 		    croak("%s", SvPVX(atsv));
+! 		}
+  	    }
+  	    break;
+--- 2990,3016 ----
+  {
+      dTHR;
++     SV *atsv = ERRSV;
+      line_t oldline = PL_curcop->cop_line;
++     CV *cv;
+      STRLEN len;
+      int ret;
+  
+      while (AvFILL(paramList) >= 0) {
+! 	cv = (CV*)av_shift(paramList);
+  	SAVEFREESV(cv);
+! 	CALLPROTECT(&ret, call_list_body, cv);
+  	switch (ret) {
+! 	case 0:
+! 	    (void)SvPV(atsv, len);
+! 	    if (len) {
+! 		PL_curcop = &PL_compiling;
+! 		PL_curcop->cop_line = oldline;
+! 		if (paramList == PL_beginav)
+! 		    sv_catpv(atsv, "BEGIN failed--compilation aborted");
+! 		else
+! 		    sv_catpv(atsv, "END failed--cleanup aborted");
+! 		while (PL_scopestack_ix > oldscope)
+! 		    LEAVE;
+! 		croak("%s", SvPVX(atsv));
+  	    }
+  	    break;
+*************** call_list(I32 oldscope, AV *paramList)
+*** 2997,3001 ****
+  	    if (PL_endav)
+  		call_list(oldscope, PL_endav);
+- 	    JMPENV_POP;
+  	    PL_curcop = &PL_compiling;
+  	    PL_curcop->cop_line = oldline;
+--- 3026,3029 ----
+*************** call_list(I32 oldscope, AV *paramList)
+*** 3009,3024 ****
+  	    /* NOTREACHED */
+  	case 3:
+! 	    if (!PL_restartop) {
+! 		PerlIO_printf(PerlIO_stderr(), "panic: restartop\n");
+! 		FREETMPS;
+! 		break;
+  	    }
+! 	    JMPENV_POP;
+! 	    PL_curcop = &PL_compiling;
+! 	    PL_curcop->cop_line = oldline;
+! 	    JMPENV_JUMP(3);
+  	}
+- 	JMPENV_POP;
+      }
+  }
+  
+--- 3037,3061 ----
+  	    /* NOTREACHED */
+  	case 3:
+! 	    if (PL_restartop) {
+! 		PL_curcop = &PL_compiling;
+! 		PL_curcop->cop_line = oldline;
+! 		JMPENV_JUMP(3);
+  	    }
+! 	    PerlIO_printf(PerlIO_stderr(), "panic: restartop\n");
+! 	    FREETMPS;
+! 	    break;
+  	}
+      }
++ }
++ 
++ STATIC void *
++ call_list_body(va_list args)
++ {
++     dTHR;
++     CV *cv = va_arg(args, CV*);
++ 
++     PUSHMARK(PL_stack_sp);
++     perl_call_sv((SV*)cv, G_EVAL|G_DISCARD);
++     return NULL;
+  }
+  
+
+Index: pp_ctl.c
+***************
+*** 30,33 ****
+--- 30,34 ----
+  #else
+  #define CALLOP *PL_op
++ static void *docatch_body _((void *o));
+  static OP *docatch _((OP *o));
+  static OP *dofindlabel _((OP *o, char *label, OP **opstack, OP **oplimit));
+*************** save_lines(AV *array, SV *sv)
+*** 2478,2481 ****
+--- 2479,2489 ----
+  }
+  
++ STATIC void *
++ docatch_body(va_list args)
++ {
++     CALLRUNOPS();
++     return NULL;
++ }
++ 
+  STATIC OP *
+  docatch(OP *o)
+*************** docatch(OP *o)
+*** 2484,2513 ****
+      int ret;
+      OP *oldop = PL_op;
+-     dJMPENV;
+  
+-     PL_op = o;
+  #ifdef DEBUGGING
+      assert(CATCH_GET == TRUE);
+-     DEBUG_l(deb("Setting up local jumplevel %p, was %p\n", &cur_env, PL_top_env));
+  #endif
+!     JMPENV_PUSH(ret);
+      switch (ret) {
+!     default:				/* topmost level handles it */
+! pass_the_buck:
+! 	JMPENV_POP;
+  	PL_op = oldop;
+  	JMPENV_JUMP(ret);
+  	/* NOTREACHED */
+-     case 3:
+- 	if (!PL_restartop)
+- 	    goto pass_the_buck;
+- 	PL_op = PL_restartop;
+- 	PL_restartop = 0;
+- 	/* FALL THROUGH */
+-     case 0:
+-         CALLRUNOPS();
+- 	break;
+      }
+-     JMPENV_POP;
+      PL_op = oldop;
+      return Nullop;
+--- 2492,2517 ----
+      int ret;
+      OP *oldop = PL_op;
+  
+  #ifdef DEBUGGING
+      assert(CATCH_GET == TRUE);
+  #endif
+!     PL_op = o;
+!  redo_body:
+!     CALLPROTECT(&ret, docatch_body);
+      switch (ret) {
+!     case 0:
+! 	break;
+!     case 3:
+! 	if (PL_restartop) {
+! 	    PL_op = PL_restartop;
+! 	    PL_restartop = 0;
+! 	    goto redo_body;
+! 	}
+! 	/* FALL THROUGH */
+!     default:
+  	PL_op = oldop;
+  	JMPENV_JUMP(ret);
+  	/* NOTREACHED */
+      }
+      PL_op = oldop;
+      return Nullop;
+
+Index: scope.c
+***************
+*** 16,19 ****
+--- 16,43 ----
+  #include "perl.h"
+  
++ void *
++ default_protect(int *except, protect_body_t body, ...)
++ {
++     dTHR;
++     dJMPENV;
++     va_list args;
++     int ex;
++     void *ret;
++ 
++     DEBUG_l(deb("Setting up local jumplevel %p, was %p\n",
++ 		&cur_env, PL_top_env));
++     JMPENV_PUSH(ex);
++     if (ex)
++ 	ret = NULL;
++     else {
++ 	va_start(args, body);
++ 	ret = body(args);
++ 	va_end(args);
++     }
++     *except = ex;
++     JMPENV_POP;
++     return ret;
++ }
++ 
+  SV**
+  stack_grow(SV **sp, SV **p, int n)
+
+Index: util.c
+*************** new_struct_thread(struct perl_thread *t)
+*** 2858,2861 ****
+--- 2858,2863 ----
+  #endif
+  
++     PL_protect = FUNC_NAME_TO_PTR(default_protect);
++ 
+      thr->oursv = sv;
+      init_stacks(ARGS);
+*************** new_struct_thread(struct perl_thread *t)
+*** 2900,2903 ****
+--- 2902,2907 ----
+      /* parent thread's data needs to be locked while we make copy */
+      MUTEX_LOCK(&t->mutex);
++ 
++     PL_protect = t->Tprotect;
+  
+      PL_curcop = t->Tcurcop;       /* XXX As good a guess as any? */
+
+-- 
+Chip Salzenberg      - a.k.a. -      <chip@perlsupport.com>
+      "When do you work?"   "Whenever I'm not busy."

@@ -1,0 +1,15 @@
+=head1 NAME
+
+  Exception::Cxx - Switch to ANSI C++ exceptions
+
+=head1 SYNOPSIS
+
+  use Exception::Cxx;
+
+=head1 DESCRIPTION
+
+This module install arranges for perl to use ANSI C++ exceptions
+(instead of C<setjmp>/C<longjmp>).  The reason you might want this is
+for integration with 3rd party libraries that already make use of C++
+exceptions.
+
